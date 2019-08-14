@@ -1,0 +1,7 @@
+checkpoints/*
+
+runs/*
+
+*.DS_Store
+
+*.pyc

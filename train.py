@@ -1,26 +1,32 @@
-from timeit import default_timer as timer
 from datetime import timedelta
-from utils.utils import *
+from timeit import default_timer as timer
+
+import argparse 
+import copy
+import json
 import math
-from usersim.usersim_test import TestRuleSimulator      
-from usersim.usersim_rule import RuleSimulator
-# from utils.wrappers import *
-from agents.agent import AgentDQN
-from dialog_system.dialog_manager import DialogManager
-from tensorboardX import SummaryWriter
-import argparse, json, copy
-import dialog_config
-import torch
 import numpy as np
 import os
+import random
 import shutil
+import torch
+
+from agents.agent import AgentDQN
+from dialog_system.dialog_manager import DialogManager
+from usersim.usersim_test import TestRuleSimulator      
+from usersim.usersim_rule import RuleSimulator
+from utils.utils import *
+from tensorboardX import SummaryWriter
+
+import dialog_config
 
 writer = SummaryWriter()
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--data_folder', dest='data_folder', type=str, default='ad_data', help='folder to all data')
 parser.add_argument('--max_turn', dest='max_turn', default=22, type=int, help='maximum ength of each dialog (default=20, 0=no maximum length)')
-parser.add_argument('--episodes', dest='episodes', default=1, type=int, help='Total number of episodes to run (default=1)')
+parser.add_argument('--meta_train_epochs', dest='meta_train_epochs', default=1, type=int, help='Total number of meta train epochs to run (default=1)')
+parser.add_argument('--meta_test_epochs', dest='meta_test_epochs', default=1, type=int, help='Total number of meta test epochs to run (default=1)')
 parser.add_argument('--slot_err_prob', dest='slot_err_prob', default=0.05, type=float, help='the slot err probability')
 parser.add_argument('--slot_err_mode', dest='slot_err_mode', default=0, type=int, help='slot_err_mode: 0 for slot_val only; 1 for three errs')
 parser.add_argument('--intent_err_prob', dest='intent_err_prob', default=0.05, type=float, help='the intent err probability')
@@ -45,12 +51,12 @@ parser.add_argument('--batch_size', dest='batch_size', type=int, default=16, hel
 parser.add_argument('--lr', dest='lr', type=float, default=0.01, help='lr for DQN')
 parser.add_argument('--gamma', dest='gamma', type=float, default=0.9, help='gamma for DQN')
 parser.add_argument('--predict_mode', dest='predict_mode', type=bool, default=False, help='predict model for DQN')
-parser.add_argument('--simulation_epoch_size', dest='simulation_epoch_size', type=int, default=50, help='the size of validation set')
+parser.add_argument('--num_simulation_episodes', dest='num_simulation_episodes', type=int, default=50, help='the size of validation set')
 parser.add_argument('--target_net_update_freq', dest='target_net_update_freq', type=int, default=1, help='update frequency')
 parser.add_argument('--warm_start', dest='warm_start', type=int, default=1, help='0: no warm start; 1: warm start for training')
-parser.add_argument('--warm_start_epochs', dest='warm_start_epochs', type=int, default=100, help='the number of epochs for warm start')
+parser.add_argument('--num_warm_start_episodes', dest='num_warm_start_episodes', type=int, default=100, help='the number of episodes for warm start')
 parser.add_argument('--supervise', dest='supervise', type=int, default=1, help='0: no supervise; 1: supervise for training')
-parser.add_argument('--supervise_epochs', dest='supervise_epochs', type=int, default=100, help='the number of epochs for supervise')
+parser.add_argument('--supervise_episodes', dest='supervise_episodes', type=int, default=100, help='the number of episodes for supervise')
 
 parser.add_argument('--trained_model_path', dest='trained_model_path', type=str, default=None, help='the path for trained model')
 parser.add_argument('-o', '--write_model_dir', dest='write_model_dir', type=str, default='./deep_dialog/checkpoints/', help='write model to disk')
@@ -69,6 +75,7 @@ print(json.dumps(params, indent=2))
 data_folder = params['data_folder']
 
 goal_set = load_pickle('{}/goal_dict_original.p'.format(data_folder))
+goal_set_tag = 'all'
 act_set = text_to_dict('{}/dia_acts.txt'.format(data_folder))  # all acts
 slot_set = text_to_dict('{}/slot_set.txt'.format(data_folder))  # all slots with symptoms + all disease
 
@@ -90,7 +97,8 @@ priority_replay = False
 if params['priority_replay'] == 1:
     priority_replay = True
 max_turn = params['max_turn']
-num_episodes = params['episodes']
+meta_train_epochs = params['meta_train_epochs']
+meta_test_epochs = params['meta_test_epochs']
 
 agt = params['agt']
 usr = params['usr']
@@ -144,29 +152,24 @@ dialog_manager = DialogManager(agent, user_sim, act_set, slot_set, dm_params)
 test_dialog_manager = DialogManager(agent, test_user_sim, act_set, slot_set, dm_params)
 status = {'successes': 0, 'count': 0, 'cumulative_reward': 0}
 
-simulation_epoch_size = params['simulation_epoch_size']
+num_simulation_episodes = params['num_simulation_episodes']
 batch_size = params['batch_size']  # default = 16
 warm_start = params['warm_start']
-warm_start_epochs = params['warm_start_epochs']
+num_warm_start_episodes = params['num_warm_start_episodes']
 supervise = params['supervise']
-supervise_epochs = params['supervise_epochs']
+supervise_episodes = params['supervise_episodes']
 success_rate_threshold = params['success_rate_threshold']
 save_check_point = params['save_check_point']
 
-""" Best Model and Performance Records """
-best_model = {}
-best_res = {'success_rate': 0, 'ave_reward': float('-inf'), 'ave_turns': float('inf'), 'epoch': 0}
-best_model['model'] = agent.model.state_dict()
-best_res['success_rate'] = 0
+best_model, best_res, best_te_model, best_te_res = {}, {}, {}, {}
+def initialize_metric_collector():
+    """ Best Model and Performance Records """
+    global best_model, best_res, best_te_model, best_te_res
+    best_model = {'model': agent.model.state_dict()}
+    best_res = {'success_rate': 0, 'ave_reward': float('-inf'), 'ave_turns': float('inf'), 'epoch': 0}
 
-best_te_model = {}
-best_te_res = {'success_rate': 0, 'ave_reward': float('-inf'), 'ave_turns': float('inf'), 'epoch': 0}
-best_te_model['model'] = agent.model.state_dict()
-
-performance_records = {}
-performance_records['success_rate'] = {}
-performance_records['ave_turns'] = {}
-performance_records['ave_reward'] = {}
+    best_te_model = {'model': agent.model.state_dict()}
+    best_te_res = {'success_rate': 0, 'ave_reward': float('-inf'), 'ave_turns': float('inf'), 'epoch': 0}
 
 run_mode = params['run_mode']
 output = False
@@ -195,15 +198,18 @@ def save_model(path, agt, agent, cur_epoch, best_epoch=0, best_success_rate=0.0,
     torch.save(checkpoint, file_path)
 
 
-def simulation_epoch(simulation_epoch_size, output=False):
+def simulation_episodes(num_episodes, goals, output=False):
     """
-    simulate dialog for simulation_epoch_size episodes, and return evaluation (avg success rate, avg reward) 
+    simulate dialog for num_episodes episodes, and return evaluation (avg success rate, avg reward) 
     """
     successes = 0
     cumulative_reward = 0
     cumulative_turns = 0
     res = {}
-    for episode in range(simulation_epoch_size):
+
+    set_dm_with_goals(goals, True)
+
+    for episode in range(num_episodes):
         dialog_manager.initialize_episode()
         episode_over = False
         while not episode_over:
@@ -216,9 +222,9 @@ def simulation_epoch(simulation_epoch_size, output=False):
                 else:
                     if output: print("simulation episode %s: Fail" % episode)
                 cumulative_turns += dialog_manager.state_tracker.turn_count
-    res['success_rate'] = float(successes) / simulation_epoch_size
-    res['ave_reward'] = float(cumulative_reward) / simulation_epoch_size
-    res['ave_turns'] = float(cumulative_turns) / simulation_epoch_size
+    res['success_rate'] = float(successes) / num_episodes
+    res['ave_reward'] = float(cumulative_reward) / num_episodes
+    res['ave_turns'] = float(cumulative_turns) / num_episodes
     print("simulation success rate %s, ave reward %s, ave turns %s" % (res['success_rate'], res['ave_reward'], res['ave_turns']))
     return res
 
@@ -256,18 +262,20 @@ def eval(simu_size, data_split, out=False):
     return res
 '''
 
-def test(simu_size, data_split, out=False):
+def test(goals, data_split_tag, out=False):
     successes = 0
     cumulative_reward = 0
     cumulative_turns = 0
-    user_sim.data_split = data_split
     res = {}
     avg_hit_rate = 0.0
     agent.epsilon = 0
-    test_dialog_manager.user.left_goal = copy.deepcopy(goal_set[data_split])
+    num_episodes = len(goals)
+
+    set_dm_with_goals(goals, False)
+
     #print(data_split)
     #print(len(test_dialog_manager.user.left_goal))
-    for episode in range(simu_size):
+    for episode in range(num_episodes):
         test_dialog_manager.initialize_episode()
         episode_over = False
         episode_hit_rate = 0
@@ -280,30 +288,32 @@ def test(simu_size, data_split, out=False):
                 episode_hit_rate += hit_rate
                 if dialog_status == dialog_config.SUCCESS_DIALOG:
                     successes += 1
-                    if out: print("%s simulation episode %s: Success" % (data_split, episode))
+                    if out: print("%s simulation episode %s: Success" % (data_split_tag, episode))
                 else:
-                    if out: print("%s simulation episode %s: Fail" % (data_split, episode))
+                    if out: print("%s simulation episode %s: Fail" % (data_split_tag, episode))
                 cumulative_turns += test_dialog_manager.state_tracker.turn_count
                 episode_hit_rate /= test_dialog_manager.state_tracker.turn_count
                 avg_hit_rate += episode_hit_rate
-    res['success_rate'] = float(successes) / float(simu_size)
-    res['ave_reward'] = float(cumulative_reward) / float(simu_size)
-    res['ave_turns'] = float(cumulative_turns) / float(simu_size)
-    avg_hit_rate = avg_hit_rate / simu_size
-    print("%s hit rate %.4f, success rate %.4f, ave reward %.4f, ave turns %.4f" % (data_split, avg_hit_rate, res['success_rate'], res['ave_reward'], res['ave_turns']))
+    res['success_rate'] = float(successes) / float(num_episodes)
+    res['ave_reward'] = float(cumulative_reward) / float(num_episodes)
+    res['ave_turns'] = float(cumulative_turns) / float(num_episodes)
+    avg_hit_rate = avg_hit_rate / num_episodes
+    print("%s hit rate %.4f, success rate %.4f, ave reward %.4f, ave turns %.4f" % (data_split_tag, avg_hit_rate, res['success_rate'], res['ave_reward'], res['ave_turns']))
     agent.epsilon = params['epsilon']
-    test_dialog_manager.user.left_goal = copy.deepcopy(goal_set[data_split])
     
     return res
 
-def warm_start_simulation():
+def warm_start_simulation(num_episodes, goals):
     successes = 0
     cumulative_reward = 0
     cumulative_turns = 0
-
     res = {}
-    warm_start_run_epochs = 0
-    for episode in range(warm_start_epochs):
+    warm_start_run_episodes = 0
+    
+    set_dm_with_goals(goals, True)
+
+    agent.warm_start = 1
+    for episode in range(num_episodes):
         dialog_manager.initialize_episode()
         episode_over = False
         while not episode_over:
@@ -316,75 +326,106 @@ def warm_start_simulation():
                 # print ("warm_start simulation episode %s: Success" % episode)
                 # else: print ("warm_start simulation episode %s: Fail" % episode)
                 cumulative_turns += dialog_manager.state_tracker.turn_count
-        warm_start_run_epochs += 1
+        warm_start_run_episodes += 1
         if len(agent.memory) >= agent.experience_replay_size:
             break
     agent.warm_start = 2
-    res['success_rate'] = float(successes) / warm_start_run_epochs
-    res['ave_reward'] = float(cumulative_reward) / warm_start_run_epochs
-    res['ave_turns'] = float(cumulative_turns) / warm_start_run_epochs
-    print("Warm_Start %s epochs, success rate %s, ave reward %s, ave turns %s" % (episode + 1, res['success_rate'], res['ave_reward'], res['ave_turns']))
+    res['success_rate'] = float(successes) / warm_start_run_episodes
+    res['ave_reward'] = float(cumulative_reward) / warm_start_run_episodes
+    res['ave_turns'] = float(cumulative_turns) / warm_start_run_episodes
+    print("Warm_Start %s episodes, success rate %s, ave reward %s, ave turns %s" % (episode + 1, res['success_rate'], res['ave_reward'], res['ave_turns']))
     print("Current experience replay buffer size %s" % (len(agent.memory)))
 
 
-def training(count):
+def set_dm_with_goals(goals, is_resample):
+    if is_resample:
+        dialog_manager.user.start_set = {goal_set_tag: copy.deepcopy(goals)}
+        user_sim.data_split = goal_set_tag
+        dialog_manager.user.data_split = goal_set_tag
+    else:
+        test_dialog_manager.user.left_goal = copy.deepcopy(goals)
+        test_user_sim.data_split = goal_set_tag
+        test_dialog_manager.user.data_split = goal_set_tag
+
+
+def get_goals_by_diseases(diseases, tag=goal_set_tag):
+    return [goal for goal in goal_set[tag] if goal['disease_tag'] in diseases]
+
+
+def sample_goals(goals, split_sizes, split_goal_sets):
+    remaining_goals = goals
+    for split_set_index, split_size in enumerate(split_sizes):
+        new_remaining_goals = []
+        sampled_index = set(random.sample(range(len(remaining_goals)), split_size))
+
+        if split_set_index == len(split_sizes)-1:
+            not_sampled_container = split_goal_sets[split_set_index+1]
+        else:
+            not_sampled_container = new_remaining_goals
+
+        for index, goal in enumerate(remaining_goals):
+            if index in sampled_index:
+                split_goal_sets[split_set_index].append(goal)
+            else:
+                not_sampled_container.append(goal)
+
+        remaining_goals = new_remaining_goals
+
+
+def split_goals(diseases, split_sizes, tag=goal_set_tag):
+    split_goal_sets = [[] for _ in range(len(split_sizes)+1)]
+
+    for disease in diseases:
+        goals = get_goals_by_diseases(set([disease]), tag)
+        sample_goals(goals, split_sizes, split_goal_sets)
+
+    return split_goal_sets
+
+
+def training(meta_train_epoch, meta_test_epoch, meta_train_diseases, meta_test_diseases, meta_test_train_size):
+    # meta_train_goals = get_goals_by_diseases(meta_train_diseases, tag='train')
+    meta_test_train_old_goals, meta_train_goals = split_goals(meta_train_diseases, [meta_test_train_size], tag='train')
+    print('qqqqq', len(meta_test_train_old_goals), len(meta_train_goals))
+
+    # meta_no_regression_goals = get_goals_by_diseases(meta_train_diseases, tag='test')
+    initialize_metric_collector()
+
     # use rule policy, and record warm start experience
     if agt == 9 and params['trained_model_path'] is None and warm_start == 1:
         print('warm_start starting ...')
         # TODO: simulate selected domains (diseases)
         # Pretraining
-        warm_start_simulation()
+        warm_start_simulation(num_warm_start_episodes, meta_train_goals)
         print('warm_start finished, start RL training ...')
-    start_episode = 0
+
+    start_epoch = 0
     print(params['trained_model_path'])
 
     if params['trained_model_path'] is not None:
         trained_file = torch.load(params['trained_model_path'])
         if 'cur_epoch' in trained_file.keys():
-            start_episode = trained_file['cur_epoch']
+            start_epoch = trained_file['cur_epoch']
 
+    # Pretraining
     # dqn simualtion, train dqn, evaluation and save model
-    for episode in range(start_episode, count):
-        print("Episode: %s" % episode)
+    for epoch in range(start_epoch, meta_train_epoch):
+        print("Epoch: %s" % epoch)
         # simulation dialogs
         if agt == 9:
-            user_sim.data_split = train_set
             agent.predict_mode = True
-            print("data split len " + str(len(user_sim.start_set[user_sim.data_split])))
-            # simulate dialogs and save experience
 
-            # TODO: simulate selected domains (diseases)
-            # Pretraining
-            # TODO: skip simulation in first epoch (only warm start???) - don't simulate when len(agent.memory) > threshold
-            # TODO: originally if not clear, new simulated dialogs added onto memory directly, no memory size limit -> weird
-            simulation_epoch(simulation_epoch_size)
+            # simulate dialogs and save experience
+            simulation_episodes(num_simulation_episodes, meta_train_goals)
 
             # train by current experience pool
             agent.train()
             agent.predict_mode = False
 
-            # TODO (bad): fine tune on new domain and then eval/test (new domain) => weird
-            # TODO: eval (old domains) as usual, early stop based on eval. Fine tune on new domain, eval/test (new domain) in every fine tune epoch
+            eval_res = test(meta_train_goals, 'meta_train_eval')
 
-            # evaluation and test
-            #eval_res = eval(5 * simulation_epoch_size, train_set)
-            eval_res = test(len(goal_set[train_set]), train_set)
-            writer.add_scalar('eval/accracy', torch.tensor(eval_res['success_rate'], device=dialog_config.device), episode)
-            writer.add_scalar('eval/ave_reward', torch.tensor(eval_res['ave_reward'], device=dialog_config.device), episode)
-            writer.add_scalar('eval/ave_turns', torch.tensor(eval_res['ave_turns'], device=dialog_config.device), episode)
-            test_res = test(len(goal_set[test_set]), test_set)
-            #test_res = eval(5 * simulation_epoch_size, test_set)
-            writer.add_scalar('test/accracy', torch.tensor(test_res['success_rate'], device=dialog_config.device), episode)
-            writer.add_scalar('test/ave_reward', torch.tensor(test_res['ave_reward'], device=dialog_config.device), episode)
-            writer.add_scalar('test/ave_turns', torch.tensor(test_res['ave_turns'], device=dialog_config.device), episode)
-
-            if test_res['success_rate'] > best_te_res['success_rate']:
-                best_te_model['model'] = agent.model.state_dict()
-                best_te_res['success_rate'] = test_res['success_rate']
-                best_te_res['ave_reward'] = test_res['ave_reward']
-                best_te_res['ave_turns'] = test_res['ave_turns']
-                best_te_res['epoch'] = episode
-                save_model(params['write_model_dir'], agt, agent, episode, best_epoch=best_te_res['epoch'],  best_success_rate=best_te_res['success_rate'],  best_ave_turns=best_te_res['ave_turns'], phase="test")
+            writer.add_scalar('meta_train_eval/accracy', torch.tensor(eval_res['success_rate'], device=dialog_config.device), epoch)
+            writer.add_scalar('meta_train_eval/ave_reward', torch.tensor(eval_res['ave_reward'], device=dialog_config.device), epoch)
+            writer.add_scalar('meta_train_eval/ave_turns', torch.tensor(eval_res['ave_turns'], device=dialog_config.device), epoch)
 
             # is not fix buffer, clear buffer when accuracy promotes
             if eval_res['success_rate'] >= best_res['success_rate']:
@@ -396,9 +437,94 @@ def training(count):
                 best_res['success_rate'] = eval_res['success_rate']
                 best_res['ave_reward'] = eval_res['ave_reward']
                 best_res['ave_turns'] = eval_res['ave_turns']
-                best_res['epoch'] = episode
-                save_model(params['write_model_dir'], agt, agent, episode, best_epoch=best_res['epoch'], best_success_rate=best_res['success_rate'], best_ave_turns=best_res['ave_turns'], phase="eval")
-            save_model(params['write_model_dir'], agt, agent, episode, is_checkpoint=True)  # save checkpoint each episode
+                best_res['epoch'] = epoch
+                save_model(params['write_model_dir'], agt, agent, epoch, best_epoch=best_res['epoch'], best_success_rate=best_res['success_rate'], best_ave_turns=best_res['ave_turns'], phase="eval")
+            save_model(params['write_model_dir'], agt, agent, epoch, is_checkpoint=True)  # save checkpoint each epoch
+
+    # TODO: sample fine-tune and test set for the same pretrained model or also pretrain for every sample
+    # Fine tuning
+    meta_test_test_old_goals = get_goals_by_diseases(meta_train_diseases, tag='test')
+    meta_test_test_new_goal_size = len(meta_test_test_old_goals) // len(meta_train_diseases)
+
+    meta_test_train_new_goals, meta_test_test_new_goals, _ = split_goals(meta_test_diseases, [meta_test_train_size, meta_test_test_new_goal_size])
+    meta_test_train_goals = meta_test_train_new_goals + meta_test_train_old_goals
+
+    print('qqqqq', len(meta_test_test_old_goals), meta_test_test_new_goal_size, len(meta_test_train_new_goals), len(meta_test_test_new_goals), len(meta_test_train_goals))
+    initialize_metric_collector()
+
+    num_diseases = len(meta_test_diseases) + len(meta_train_diseases)
+
+    if agt == 9:
+        agent.memory.clear()
+        #warm_start_simulation(num_warm_start_episodes, meta_test_train_goals)
+        warm_start_simulation(num_simulation_episodes, meta_test_train_new_goals)
+        #warm_start_simulation(num_simulation_episodes // (num_diseases) * len(meta_test_diseases), meta_test_train_new_goals)
+        #simulation_episodes(num_simulation_episodes // (num_diseases) * len(meta_train_diseases), meta_test_train_old_goals)
+
+    ppp = 0.5
+
+    for epoch in range(meta_test_epoch):
+        print("Meta test epoch: %s" % epoch)
+        # simulation dialogs
+        if agt == 9:
+            agent.predict_mode = True
+
+            # simulate dialogs and save experience
+            if random.random() < ppp:
+                simulation_episodes(num_simulation_episodes, meta_train_goals)
+            else:
+                if epoch < 100:
+                    warm_start_simulation(num_simulation_episodes, meta_test_train_new_goals)
+                    #warm_start_simulation(num_simulation_episodes // (num_diseases) * len(meta_test_diseases), meta_test_train_new_goals)
+                    #simulation_episodes(num_simulation_episodes // (num_diseases) * len(meta_train_diseases), meta_test_train_old_goals)
+                else:
+                    simulation_episodes(num_simulation_episodes, meta_test_train_new_goals)
+
+            # train by current experience pool
+            agent.train()
+            agent.predict_mode = False
+
+            eval_res = test(meta_test_train_goals, 'meta_test_eval')
+            # TODO: other ways to decide when to clear memory
+
+            writer.add_scalar('meta_test_eval/accracy', torch.tensor(eval_res['success_rate'], device=dialog_config.device), epoch)
+            writer.add_scalar('meta_test_eval/ave_reward', torch.tensor(eval_res['ave_reward'], device=dialog_config.device), epoch)
+            writer.add_scalar('meta_test_eval/ave_turns', torch.tensor(eval_res['ave_turns'], device=dialog_config.device), epoch)
+
+            # is not fix buffer, clear buffer when accuracy promotes
+            #if eval_res['success_rate'] >= best_res['success_rate']:
+                #if eval_res['success_rate'] >= success_rate_threshold and not fix_buffer:  # threshold = 0.30
+            if epoch and epoch % 10 == 0:
+                agent.memory.clear()
+
+            if eval_res['success_rate'] > best_res['success_rate']:
+                best_model['model'] = agent.model.state_dict()
+                best_res['success_rate'] = eval_res['success_rate']
+                best_res['ave_reward'] = eval_res['ave_reward']
+                best_res['ave_turns'] = eval_res['ave_turns']
+                best_res['epoch'] = epoch
+                save_model(params['write_model_dir'], agt, agent, epoch, best_epoch=best_res['epoch'], best_success_rate=best_res['success_rate'], best_ave_turns=best_res['ave_turns'], phase="eval")
+
+            save_model(params['write_model_dir'], agt, agent, epoch, is_checkpoint=True)  # save checkpoint each epoch
+
+            test_res = test(meta_test_test_new_goals + meta_test_test_old_goals, 'meta_test_test')
+            test_res = test(meta_test_test_new_goals, 'meta_test_test_new_diseases')
+            test_res = test(meta_test_test_old_goals, 'meta_test_test_old_diseases')
+
+            writer.add_scalar('meta_test_test/accracy', torch.tensor(test_res['success_rate'], device=dialog_config.device), epoch)
+            writer.add_scalar('meta_test_test/ave_reward', torch.tensor(test_res['ave_reward'], device=dialog_config.device), epoch)
+            writer.add_scalar('meta_test_test/ave_turns', torch.tensor(test_res['ave_turns'], device=dialog_config.device), epoch)
+
+            if test_res['success_rate'] > best_te_res['success_rate']:
+                best_te_model['model'] = agent.model.state_dict()
+                best_te_res['success_rate'] = test_res['success_rate']
+                best_te_res['ave_reward'] = test_res['ave_reward']
+                best_te_res['ave_turns'] = test_res['ave_turns']
+                best_te_res['epoch'] = epoch
+                save_model(params['write_model_dir'], agt, agent, epoch, best_epoch=best_te_res['epoch'],  best_success_rate=best_te_res['success_rate'],  best_ave_turns=best_te_res['ave_turns'], phase="test")
 
 
-training(num_episodes)
+meta_train_diseases = set(['小儿消化不良', '上呼吸道感染', '小儿腹泻'])
+meta_test_diseases = set(['小儿支气管炎'])
+meta_test_train_size = 5
+training(meta_train_epochs, meta_test_epochs, meta_train_diseases, meta_test_diseases, meta_test_train_size)

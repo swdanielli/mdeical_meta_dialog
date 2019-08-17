@@ -1,0 +1,16 @@
+v4: clear agent memory every epoch -> very unstable
+
+v5: clear agent memory every 10 epoch
+- ppp (probability of using old disease memory to train)
+- ppp = 0.1: success rate 0.6597 (new: 0.9444, old: 0.5648)
+- ppp = 0.3: success rate 0.6458 (0.8889, 0.5648)
+- ppp = 0.5: success rate 0.6667 (0.6389, 0.6759)
+- ppp = 0.7: success rate 0.6250 (0.3889, 0.7037)
+- ppp = 0.9: success rate 0.6250 (0.3889, 0.7037)
+
+
+next steps:
+- [IMPORTANT]: hyperparameter tuning (e.g., ppp, frequency of clearing memory)
+- tune fine-tune learning rate
+- change experience/memory simulation and clear schedule
+- life long learing (include |w - w_old| in loss function)
